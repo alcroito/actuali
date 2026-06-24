@@ -24,14 +24,6 @@ Website: [actuali.mfazz.com](https://actuali.mfazz.com)
 - **Light & dark mode**
 - No analytics, no third-party tracking. The app talks only to the Actual server you configure.
 
-## Roadmap
-
-Planned — contributions welcome (see [CONTRIBUTING.md](CONTRIBUTING.md)):
-
-- **Encrypted budgets** — end-to-end password-protected sync (E2E)
-
-Found a bug or want to request a feature? Open a [GitHub issue](https://github.com/MattFaz/actuali/issues).
-
 ## Requirements
 
 - A self-hosted [Actual Budget server](https://actualbudget.org/docs/install/) you can reach from your phone
