@@ -9,31 +9,18 @@ struct DashboardView: View {
     /// nil while the fetch is in flight.
     @State private var reportTransactions: [Transaction]?
 
-    /// Widget types that are collapsed into a single top banner instead of
-    /// each rendering as a "Coming soon" card. Keep this list short; only
-    /// types that are common AND prominent on real dashboards belong here.
-    private static let hiddenTypes: [String: String] = [
-        "custom-report": "Custom Report",
-        "formula-card": "Formula"
-    ]
-
-    private var hiddenTypeLabels: [String] {
-        let found = widgets.compactMap { widget -> String? in
-            if case .unsupported(_, let type) = widget {
-                return Self.hiddenTypes[type]
-            }
-            return nil
+    /// Unsupported widgets never render as cards; a single top banner notes
+    /// that only a limited set of reports is available.
+    private var hasUnsupportedWidgets: Bool {
+        widgets.contains {
+            if case .unsupported = $0 { return true }
+            return false
         }
-        // De-duplicate while preserving first-seen order.
-        var seen = Set<String>()
-        return found.filter { seen.insert($0).inserted }
     }
 
     private var visibleWidgets: [DashboardWidget] {
         widgets.filter {
-            if case .unsupported(_, let type) = $0, Self.hiddenTypes[type] != nil {
-                return false
-            }
+            if case .unsupported = $0 { return false }
             return true
         }
     }
@@ -48,9 +35,8 @@ struct DashboardView: View {
         } else {
             ScrollView {
                 LazyVStack(spacing: 12) {
-                    let hidden = hiddenTypeLabels
-                    if !hidden.isEmpty {
-                        UnsupportedTypesNotice(typeLabels: hidden)
+                    if hasUnsupportedWidgets {
+                        UnsupportedTypesNotice()
                     }
                     ForEach(visibleWidgets, id: \.id) { widget in
                         widgetView(for: widget)
@@ -87,7 +73,12 @@ struct DashboardView: View {
             }
         case .cashFlow(_, let meta):
             WidgetCard(transactions: reportTransactions, loadingHeight: 200) { transactions in
-                CashFlowEngine.compute(meta: meta, transactions: transactions, today: Date())
+                CashFlowEngine.compute(
+                    meta: meta,
+                    transactions: transactions,
+                    offBudgetAccountIds: Set(budgetStore.accounts.filter(\.offBudget).map(\.id)),
+                    today: Date()
+                )
             } content: { data in
                 CashFlowWidgetView(displayName: widget.displayName, data: data)
             }
@@ -103,11 +94,9 @@ struct DashboardView: View {
             }
         case .markdown(_, let meta):
             MarkdownWidgetView(meta: meta)
-        default:
-            UnsupportedWidgetView(
-                displayName: widget.displayName,
-                typeLabel: widget.typeLabel
-            )
+        case .unsupported:
+            // Filtered out of visibleWidgets; listed in the top notice instead.
+            EmptyView()
         }
     }
 
