@@ -1636,7 +1636,7 @@ class BudgetDatabase {
               maxDistanceMeters.isFinite, maxDistanceMeters > 0 else {
             return []
         }
-        let rows = try await dbQueue.read { db in
+        let rows = try await dbQueue.read { db -> [Row] in
             try Row.fetchAll(db, sql: """
                 SELECT pl.id AS location_id, pl.payee_id, pl.latitude, pl.longitude, pl.created_at,
                        p.name, p.transfer_acct
