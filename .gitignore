@@ -2,6 +2,7 @@
 actual/
 
 # Xcode
+/build/
 *.xcuserstate
 *.xcuserdatad
 xcuserdata/

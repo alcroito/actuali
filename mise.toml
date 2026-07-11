@@ -1,0 +1,27 @@
+[env]
+PROJECT = "Actuali/Actuali.xcodeproj"
+SCHEME = "Actuali"
+
+[tasks.list-schemes]
+description = "Confirm the shared Actuali scheme is visible to xcodebuild"
+run = "xcodebuild -list -project $PROJECT"
+
+[tasks.version-label]
+description = "Print the CI version label for the current context (override via env)"
+run = "./scripts/ci/derive-version-label.sh"
+
+[tasks.build-ipa]
+description = "Build the unsigned IPA locally (same script CI runs)"
+env = { LABEL = "localtest", OUT_DIR = "./build" }
+run = "./scripts/ci/build-unsigned-ipa.sh"
+
+[tasks.release-test]
+description = "Create a throwaway release to exercise the release workflow, then show it"
+run = [
+  "gh release create v0.0.0-ci-test --title 'CI test' --notes 'temporary; delete after verifying' --prerelease",
+  "gh release view v0.0.0-ci-test",
+]
+
+[tasks.release-test-clean]
+description = "Delete the throwaway test release and its tag"
+run = "gh release delete v0.0.0-ci-test --cleanup-tag --yes"
