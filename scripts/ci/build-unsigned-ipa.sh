@@ -29,4 +29,7 @@ mkdir -p "$OUT_DIR/Payload"
 cp -R "$ARCHIVE/Products/Applications/Actuali.app" "$OUT_DIR/Payload/"
 ( cd "$OUT_DIR" && rm -f "$IPA" && zip -qr "$IPA" Payload )
 
-echo "ipa=$IPA" >> "${GITHUB_OUTPUT:-/dev/stdout}"
+{
+  echo "ipa=$IPA"
+  echo "app=$OUT_DIR/Payload/Actuali.app"   # for metadata extraction
+} >> "${GITHUB_OUTPUT:-/dev/stdout}"
