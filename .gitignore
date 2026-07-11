@@ -27,6 +27,8 @@ Packages/
 Package.pins
 Package.resolved
 *.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+# Track the resolved SwiftPM versions so CI builds a reproducible dependency set
+!/Actuali/Actuali.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 
 # CocoaPods
 Pods/
