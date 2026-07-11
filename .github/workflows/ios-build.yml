@@ -30,6 +30,7 @@ jobs:
       bundleId: ${{ steps.meta.outputs.bundleId }}
       minOS: ${{ steps.meta.outputs.minOS }}
       size: ${{ steps.meta.outputs.size }}
+      privacy: ${{ steps.meta.outputs.privacy }}
     steps:
       - uses: actions/checkout@v4
 
@@ -112,6 +113,7 @@ jobs:
           BUILD_VERSION: ${{ needs.build.outputs.buildVersion }}
           MIN_OS: ${{ needs.build.outputs.minOS }}
           SIZE: ${{ needs.build.outputs.size }}
+          PRIVACY: ${{ needs.build.outputs.privacy }}
           LABEL: ${{ needs.build.outputs.label }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           RELEASE_DATE: ${{ github.event.release.published_at }}
