@@ -69,21 +69,57 @@
     <h1>__APP_NAME__</h1>
     <p class="ver">Latest: __VERSION__ · unsigned</p>
 
-    <a class="btn primary" href="altstore://source?url=__SOURCE_URL__">Add source to AltStore</a>
+    <!-- Classic-specific scheme: plain altstore:// is grabbed ambiguously by
+         AltStore PAL when both are installed (PAL only takes marketplace
+         sources, so it fails). altstore-classic:// requires AltStore 2.2+. -->
+    <a class="btn primary" href="altstore-classic://source?url=__SOURCE_URL__">Add source to AltStore Classic</a>
     <a class="btn secondary" href="sidestore://source?url=__SOURCE_URL__">Add source to SideStore</a>
     <a class="btn secondary" href="__DOWNLOAD_URL__">Download .ipa directly</a>
 
-    <p class="url">
-      Source URL (paste manually if the buttons don't open your app):<br />
+    <div class="url">
+      <p style="margin:.25rem 0">Or copy the source URL and paste it into your app:</p>
+      <button id="copy" class="btn secondary" type="button" data-url="__SOURCE_URL__">Copy source URL</button>
       <code>__SOURCE_URL__</code>
-    </p>
+    </div>
 
     <p class="note">
       This is an <strong>unofficial</strong> source serving unsigned builds.
-      AltStore/SideStore re-signs the app on-device with your own Apple ID, so
-      no paid Apple Developer account is needed. With a free Apple ID the app
-      expires after 7 days and must be refreshed.
+      AltStore Classic / SideStore re-signs the app on-device with your own
+      Apple ID, so no paid Apple Developer account is needed. With a free Apple
+      ID the app expires after 7 days and must be refreshed. AltStore PAL (EU
+      marketplace) can't install this — it only accepts marketplace sources.
     </p>
   </main>
+
+  <script>
+    (function () {
+      var btn = document.getElementById("copy");
+      if (!btn) return;
+      var label = btn.textContent;
+      btn.addEventListener("click", function () {
+        var url = btn.getAttribute("data-url");
+        var done = function (ok) {
+          btn.textContent = ok ? "Copied!" : "Copy failed — long-press the link";
+          setTimeout(function () { btn.textContent = label; }, 1800);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(url).then(function () { done(true); }, function () { done(false); });
+        } else {
+          // Fallback for older WebKit without the async clipboard API.
+          var ta = document.createElement("textarea");
+          ta.value = url;
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.focus();
+          ta.select();
+          var ok = false;
+          try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+          document.body.removeChild(ta);
+          done(ok);
+        }
+      });
+    })();
+  </script>
 </body>
 </html>

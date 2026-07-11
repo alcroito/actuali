@@ -34,6 +34,8 @@ SUBTITLE="${SUBTITLE:-Unsigned builds of Actuali}"
 DESCRIPTION="${DESCRIPTION:-Unofficial AltStore source serving unsigned Actuali builds. Each install is re-signed on-device with your own Apple ID.}"
 TINT_COLOR="${TINT_COLOR:-8719E0}"          # app accent color, hex without '#'
 RELEASE_BODY="${RELEASE_BODY:-}"            # release notes -> per-version changelog
+PRIVACY="${PRIVACY:-{\}}"                   # {NSKey: description} the app requests
+ENTITLEMENTS="${ENTITLEMENTS:-[]}"          # entitlement identifiers (none for unsigned)
 
 owner_lc="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
 repo_name="${REPO#*/}"
@@ -43,6 +45,10 @@ ICON_URL="$PAGES_BASE/icon.png"
 DOWNLOAD_URL="$SERVER_URL/$REPO/releases/download/$RELEASE_TAG/Actuali-$LABEL-unsigned.ipa"
 
 mkdir -p "$SITE_DIR"
+
+# Guard against malformed/empty permission inputs.
+printf '%s' "$PRIVACY" | jq empty 2>/dev/null || PRIVACY='{}'
+printf '%s' "$ENTITLEMENTS" | jq empty 2>/dev/null || ENTITLEMENTS='[]'
 
 # Prior versions (best effort; empty on the first ever deploy).
 prev='[]'
@@ -75,6 +81,8 @@ jq -n \
   --arg desc "$DESCRIPTION" \
   --arg iconURL "$ICON_URL" \
   --arg tintColor "$TINT_COLOR" \
+  --argjson privacy "$PRIVACY" \
+  --argjson entitlements "$ENTITLEMENTS" \
   --argjson versions "$versions" \
   '{
     name: $name,
@@ -91,6 +99,7 @@ jq -n \
       iconURL: $iconURL,
       tintColor: $tintColor,
       category: "utilities",
+      appPermissions: { entitlements: $entitlements, privacy: $privacy },
       versions: $versions
     } ],
     news: []

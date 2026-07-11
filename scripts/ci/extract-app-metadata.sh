@@ -16,10 +16,21 @@ bundleId="$(pb CFBundleIdentifier)"
 minOS="$(pb MinimumOSVersion)"
 size="$(stat -f%z "$IPA")"
 
+# Privacy usage descriptions (NS*UsageDescription) as a {key: description} map.
+# AltStore blocks install unless the source declares every permission the app
+# requests, so derive them from the built app to keep the source in sync.
+privacy="$(plutil -convert json -o - "$PLIST" \
+  | jq -c 'to_entries | map(select(.key | test("UsageDescription$"))) | from_entries')"
+
+out="${GITHUB_OUTPUT:-/dev/stdout}"
 {
   echo "version=$version"
   echo "buildVersion=$buildVersion"
   echo "bundleId=$bundleId"
   echo "minOS=$minOS"
   echo "size=$size"
-} >> "${GITHUB_OUTPUT:-/dev/stdout}"
+  # delimiter form: privacy is JSON and may contain arbitrary description text
+  echo "privacy<<PRIVACY_EOF"
+  echo "$privacy"
+  echo "PRIVACY_EOF"
+} >> "$out"
