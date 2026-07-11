@@ -15,6 +15,11 @@ description = "Build the unsigned IPA locally (same script CI runs)"
 env = { LABEL = "localtest", OUT_DIR = "./build" }
 run = "./scripts/ci/build-unsigned-ipa.sh"
 
+[tasks.altstore-pages]
+description = "Assemble the AltStore Pages site locally into ./build/_site (preview; uses dummy metadata)"
+env = { SITE_DIR = "./build/_site", BUNDLE_ID = "com.mfazz.ActualiOS", VERSION = "0.0.0", BUILD_VERSION = "0", MIN_OS = "26.0", SIZE = "0", LABEL = "localtest", RELEASE_TAG = "v0.0.0", RELEASE_DATE = "2026-01-01T00:00:00Z", REPO = "alcroito/actuali", OWNER = "alcroito", PAGES_BASE = "http://localhost:8000" }
+run = "./scripts/ci/assemble-altstore-pages.sh"
+
 [tasks.release-test]
 description = "Create a throwaway release to exercise the release workflow, then show it"
 run = [
