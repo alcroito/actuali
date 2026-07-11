@@ -23,6 +23,13 @@ permissions:
 jobs:
   build:
     runs-on: macos-26     # Xcode 26 / iOS 26.1 SDK; iOS 26 target can't build on macos-15
+    outputs:
+      label: ${{ steps.ver.outputs.label }}
+      version: ${{ steps.meta.outputs.version }}
+      buildVersion: ${{ steps.meta.outputs.buildVersion }}
+      bundleId: ${{ steps.meta.outputs.bundleId }}
+      minOS: ${{ steps.meta.outputs.minOS }}
+      size: ${{ steps.meta.outputs.size }}
     steps:
       - uses: actions/checkout@v4
 
@@ -44,6 +51,13 @@ jobs:
         env:
           LABEL: ${{ steps.ver.outputs.label }}
         run: ./scripts/ci/build-unsigned-ipa.sh
+
+      - name: Extract app metadata
+        id: meta
+        env:
+          APP: ${{ steps.pkg.outputs.app }}
+          IPA: ${{ steps.pkg.outputs.ipa }}
+        run: ./scripts/ci/extract-app-metadata.sh
 
       - uses: actions/upload-artifact@v4
         with:
@@ -72,3 +86,46 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           IPA: ${{ steps.pkg.outputs.ipa }}
         run: ./scripts/ci/upload-release-asset.sh
+
+  # Release only: publish the AltStore source (source.json + landing page +
+  # icon) to GitHub Pages. downloadURL points at the release asset uploaded by
+  # `build`, so this must run after it.
+  publish-source:
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble AltStore Pages site
+        env:
+          SITE_DIR: _site
+          BUNDLE_ID: ${{ needs.build.outputs.bundleId }}
+          VERSION: ${{ needs.build.outputs.version }}
+          BUILD_VERSION: ${{ needs.build.outputs.buildVersion }}
+          MIN_OS: ${{ needs.build.outputs.minOS }}
+          SIZE: ${{ needs.build.outputs.size }}
+          LABEL: ${{ needs.build.outputs.label }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_DATE: ${{ github.event.release.published_at }}
+          RELEASE_BODY: ${{ github.event.release.body }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          SERVER_URL: ${{ github.server_url }}
+        run: ./scripts/ci/assemble-altstore-pages.sh
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
