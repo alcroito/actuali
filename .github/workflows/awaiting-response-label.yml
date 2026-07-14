@@ -4,7 +4,8 @@ name: Manage awaiting-response label
 # comments, the ball is in the other person's court, so the issue gets the
 # "awaiting response" label. When anyone else comments, they've responded, so
 # the label comes off. Bot comments (CI, github-actions, etc.) are ignored so
-# they don't clear the label.
+# they don't clear the label. Closed issues never get the label — no response
+# is expected once the conversation is resolved.
 #
 # Any human comment also clears the "stale" label (applied by the daily
 # stale-awaiting-response workflow), since the conversation clock has reset.
@@ -32,6 +33,7 @@ jobs:
           AUTHOR: ${{ github.event.sender.login }}
           AUTHOR_TYPE: ${{ github.event.sender.type }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_STATE: ${{ github.event.issue.state }}
           LABEL: awaiting response
           STALE_LABEL: stale
         run: |
@@ -51,6 +53,10 @@ jobs:
           remove_label "$STALE_LABEL"
 
           if [ "$AUTHOR" = "$OWNER" ]; then
+            if [ "$ISSUE_STATE" != "open" ]; then
+              echo "Issue #$ISSUE_NUMBER is $ISSUE_STATE; not adding '$LABEL'."
+              exit 0
+            fi
             echo "Owner $AUTHOR commented; adding '$LABEL' to issue #$ISSUE_NUMBER."
             gh api "repos/$REPO/issues/$ISSUE_NUMBER/labels" -f "labels[]=$LABEL"
           else

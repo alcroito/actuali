@@ -163,7 +163,15 @@ class BudgetDatabase {
     private let dbQueue: DatabaseQueue
 
     init(path: URL) throws {
-        dbQueue = try DatabaseQueue(path: path.path)
+        // Concurrent opens of the same file are expected: on a cold headless
+        // Shortcut launch, the store's budget load races the temporary
+        // connection `accountsForIntent()` opens for entity resolution. GRDB's
+        // default busy mode (.immediateError) turns that brief overlap into a
+        // spurious SQLITE_BUSY, which BudgetStore then treats as a failed
+        // load. Wait for the lock instead — contention here is milliseconds.
+        var config = Configuration()
+        config.busyMode = .timeout(5)
+        dbQueue = try DatabaseQueue(path: path.path, configuration: config)
         try runPendingMigrations()
     }
 
@@ -179,6 +187,12 @@ class BudgetDatabase {
     private static let upstreamSchemaMigrations: [(
         id: Int64, table: String, addsColumn: String?, requiresColumns: [String], sql: String
     )] = [
+        // Second half of upstream 1765518577215 (multiple dashboards, see
+        // createTableMigrations): widgets gain a page pointer. Files that
+        // predate the migration get the column here so page-assignment CRDT
+        // messages can land instead of being skipped.
+        (1765518577216, "dashboard", "dashboard_page_id", [],
+         "ALTER TABLE dashboard ADD COLUMN dashboard_page_id TEXT"),
         (1769000000000, "schedules", "custom_upcoming_length", [],
          "ALTER TABLE schedules ADD COLUMN custom_upcoming_length TEXT DEFAULT NULL"),
         // Upstream 1778510362740 also creates cleanup_groups (see createTableMigrations).
@@ -202,6 +216,19 @@ class BudgetDatabase {
     // Tables added upstream after the original budget file was created. These run
     // unconditionally so CRDT messages targeting these tables have somewhere to land.
     private static let createTableMigrations: [(id: Int64, sql: String)] = [
+        // Upstream 1765518577215 (multiple dashboards): pages table. Only the
+        // schema half of upstream's migration — upstream also mints a default
+        // "Main" page and moves widgets onto it, but that half generates no
+        // CRDT messages and forks a fresh page id on every client that runs
+        // it, so doing it here would add yet another divergent page. Pageless
+        // widgets still render via the fallback in fetchWidgets().
+        (1765518577215, """
+            CREATE TABLE IF NOT EXISTS dashboard_pages (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                tombstone INTEGER DEFAULT 0
+            )
+            """),
         // Upstream 1768872504000 (Actual 26.4.0): payee locations. Same SQL
         // as upstream's migration, so we reuse its id — a file already
         // migrated by a modern client skips this cleanly.
@@ -263,7 +290,32 @@ class BudgetDatabase {
         """)
     ]
 
+    /// Whether `runPendingMigrations()` would perform any write. Mirrors the
+    /// guards of the write path below so a fully migrated file opens without
+    /// ever taking the write lock — opening is a hot, concurrent path (see
+    /// `init`). Migrations whose guards aren't satisfied yet (source table or
+    /// required columns missing) are not work: the write path would skip them
+    /// too. Internal for tests.
+    static func pendingMigrationWork(_ db: Database) throws -> Bool {
+        guard try db.tableExists("__migrations__") else { return true }
+        let appliedIds = Set(try Int64.fetchAll(db, sql: "SELECT id FROM __migrations__"))
+
+        if createTableMigrations.contains(where: { !appliedIds.contains($0.id) }) {
+            return true
+        }
+        for migration in upstreamSchemaMigrations where !appliedIds.contains(migration.id) {
+            guard try db.tableExists(migration.table) else { continue }
+            let existing = Set(try db.columns(in: migration.table).map(\.name))
+            guard migration.requiresColumns.allSatisfy(existing.contains) else { continue }
+            // Runnable (ALTER/CREATE INDEX), or the column already exists and
+            // needs its bookkeeping row — either way the write path has work.
+            return true
+        }
+        return false
+    }
+
     private func runPendingMigrations() throws {
+        guard try dbQueue.read({ try Self.pendingMigrationWork($0) }) else { return }
         try dbQueue.write { db in
             try db.execute(sql: "CREATE TABLE IF NOT EXISTS __migrations__ (id INTEGER PRIMARY KEY)")
 
@@ -395,15 +447,35 @@ class BudgetDatabase {
 
     // MARK: - Transactions
 
-    func fetchTransactions(accountId: String? = nil, limit: Int = 100) async throws -> [Transaction] {
+    /// Rows per page in the transaction lists. One page is the default for
+    /// `fetchTransactions`, and TransactionPager treats a shorter page as
+    /// the end of the result set.
+    static let transactionPageSize = 500
+
+    /// Page through transactions newest-first, optionally scoped to one
+    /// account and/or filtered by a free-text search. `search` applies the
+    /// TransactionSearchMatcher semantics (payee, category, notes, and
+    /// progressive amount matching) in SQL so it covers full history, not
+    /// just the loaded page.
+    func fetchTransactions(
+        accountId: String? = nil,
+        limit: Int = BudgetDatabase.transactionPageSize,
+        offset: Int = 0,
+        search: String? = nil
+    ) async throws -> [Transaction] {
         try await dbQueue.read { db in
+            // The list's display payee: own payee first (transfer payees show
+            // the linked account's name), else the split children's agreed
+            // payee. Referenced by both SELECT and the search filter, which
+            // must match what the row visibly shows.
+            let payeeNameSQL = "COALESCE(pa.name, p.name, cpa.name, cp.name)"
             var sql = """
                 SELECT
                     t.id, t.isParent, t.isChild, t.acct, t.category, t.amount,
                     t.description, t.notes, t.date, t.imported_description,
                     t.transferred_id, t.cleared, t.reconciled, t.sort_order,
                     t.tombstone, t.parent_id,
-                    COALESCE(pa.name, p.name, cpa.name, cp.name) as payee_name,
+                    \(payeeNameSQL) as payee_name,
                     c.name as category_name
                 FROM transactions t
                 LEFT JOIN payee_mapping pm ON pm.id = t.description
@@ -436,15 +508,39 @@ class BudgetDatabase {
                   AND (t.isChild = 0 OR t.isChild IS NULL)
                 """
 
-            var arguments: [String] = []
+            var arguments: [(any DatabaseValueConvertible)?] = []
 
             if let accountId {
                 sql += " AND t.acct = ?"
                 arguments.append(accountId)
             }
 
-            sql += " ORDER BY t.date DESC, t.sort_order DESC LIMIT ?"
-            arguments.append(String(limit))
+            if let search {
+                let matcher = TransactionSearchMatcher(search)
+                if !matcher.text.isEmpty {
+                    let escaped = matcher.text
+                        .replacingOccurrences(of: "\\", with: "\\\\")
+                        .replacingOccurrences(of: "%", with: "\\%")
+                        .replacingOccurrences(of: "_", with: "\\_")
+                    let pattern = "%\(escaped)%"
+                    var clauses = [
+                        "\(payeeNameSQL) LIKE ? ESCAPE '\\'",
+                        "c.name LIKE ? ESCAPE '\\'",
+                        "t.notes LIKE ? ESCAPE '\\'"
+                    ]
+                    arguments.append(contentsOf: [pattern, pattern, pattern])
+                    if let range = matcher.amountCentsRange {
+                        clauses.append("ABS(t.amount) BETWEEN ? AND ?")
+                        arguments.append(range.lowerBound)
+                        arguments.append(range.upperBound)
+                    }
+                    sql += " AND (" + clauses.joined(separator: " OR ") + ")"
+                }
+            }
+
+            sql += " ORDER BY t.date DESC, t.sort_order DESC LIMIT ? OFFSET ?"
+            arguments.append(limit)
+            arguments.append(offset)
 
             let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
 
@@ -632,6 +728,84 @@ class BudgetDatabase {
     func fetchUncategorizedCount() async throws -> Int {
         try await dbQueue.read { db in
             try Int.fetchOne(db, sql: "SELECT COUNT(*) \(Self.uncategorizedJoins) \(Self.uncategorizedWhere)") ?? 0
+        }
+    }
+
+    /// Every transaction that counts toward a category's spend, newest first,
+    /// optionally narrowed to one "yyyy-MM" month (GH #56). Mirrors the
+    /// budget month's spent query so the list reconciles with the "Spent"
+    /// figure the user tapped: split children included (that's where split
+    /// spend lives), split parents excluded even when a pre-split category
+    /// lingers on the parent row, category ids resolved through
+    /// category_mapping, and tombstoned rows / orphaned children /
+    /// off-budget accounts filtered out.
+    func fetchCategoryTransactions(categoryId: String, month: String?) async throws -> [Transaction] {
+        try await dbQueue.read { db in
+            var sql = """
+                SELECT
+                    t.id, t.isParent, t.isChild, t.acct, t.category, t.amount,
+                    t.description, t.notes, t.date, t.imported_description,
+                    t.transferred_id, t.cleared, t.reconciled, t.sort_order,
+                    t.tombstone, t.parent_id,
+                    COALESCE(pa.name, p.name, ppa.name, pp.name) as payee_name,
+                    c.name as category_name
+                FROM transactions t
+                JOIN accounts a ON a.id = t.acct
+                LEFT JOIN payee_mapping pm ON pm.id = t.description
+                LEFT JOIN payees p ON p.id = pm.targetId
+                -- Transfer payees carry no name; their display name is the
+                -- linked account's name (matches Actual's v_payees view).
+                LEFT JOIN accounts pa ON pa.id = p.transfer_acct
+                    AND (pa.tombstone = 0 OR pa.tombstone IS NULL)
+                -- Parent's payee, as the fallback for split children.
+                LEFT JOIN transactions par ON par.id = t.parent_id
+                LEFT JOIN payee_mapping ppm ON ppm.id = par.description
+                LEFT JOIN payees pp ON pp.id = ppm.targetId
+                LEFT JOIN accounts ppa ON ppa.id = pp.transfer_acct
+                    AND (ppa.tombstone = 0 OR ppa.tombstone IS NULL)
+                LEFT JOIN category_mapping cm ON cm.id = t.category
+                LEFT JOIN categories c ON c.id = COALESCE(cm.transferId, t.category)
+                WHERE (t.tombstone = 0 OR t.tombstone IS NULL)
+                  AND (t.parent_id IS NULL OR par.tombstone = 0 OR par.tombstone IS NULL)
+                  AND (t.isParent = 0 OR t.isParent IS NULL)
+                  AND COALESCE(cm.transferId, t.category) = ?
+                  AND a.offbudget = 0
+                  AND (a.tombstone = 0 OR a.tombstone IS NULL)
+                """
+
+            var arguments: [DatabaseValueConvertible] = [categoryId]
+
+            // Dates are YYYYMMDD ints, so date/100 is the YYYYMM month.
+            if let month, let monthInt = Int(month.replacingOccurrences(of: "-", with: "")) {
+                sql += " AND (t.date / 100) = ?"
+                arguments.append(monthInt)
+            }
+
+            sql += " ORDER BY t.date DESC, t.sort_order DESC"
+
+            let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
+
+            return rows.map { row in
+                Transaction(
+                    id: row["id"],
+                    accountId: row["acct"] ?? "",
+                    date: row["date"] ?? 0,
+                    amount: row["amount"] ?? 0,
+                    payeeId: row["description"],
+                    payeeName: row["payee_name"],
+                    categoryId: row["category"],
+                    categoryName: row["category_name"],
+                    notes: row["notes"],
+                    cleared: row["cleared"] == 1,
+                    reconciled: row["reconciled"] == 1,
+                    transferId: row["transferred_id"],
+                    isParent: row["isParent"] == 1,
+                    parentId: row["parent_id"],
+                    tombstone: row["tombstone"] == 1,
+                    sortOrder: row["sort_order"],
+                    importedPayee: row["imported_description"]
+                )
+            }
         }
     }
 
@@ -1209,12 +1383,40 @@ class BudgetDatabase {
 
     func fetchWidgets() async throws -> [DashboardWidget] {
         try await dbQueue.read { db in
-            let rows = try Row.fetchAll(db, sql: """
-                SELECT id, type, meta
-                FROM dashboard
+            // The web app treats pages as separate dashboards and opens the
+            // first live one (ReportsDashboardRouter → dashboardPages[0]), so
+            // widgets on other, deleted, or unknown pages must not render.
+            // Upstream's migration mints a fresh "Main" page id on every
+            // client that runs it, so a synced budget can carry full
+            // duplicate widget sets under orphaned page ids (GH: Reports
+            // showed every widget twice).
+            let firstLivePageId = try String.fetchOne(db, sql: """
+                SELECT id FROM dashboard_pages
                 WHERE (tombstone = 0 OR tombstone IS NULL)
-                ORDER BY y ASC, x ASC
+                ORDER BY rowid ASC
+                LIMIT 1
                 """)
+
+            let rows: [Row]
+            if let firstLivePageId {
+                rows = try Row.fetchAll(db, sql: """
+                    SELECT id, type, meta
+                    FROM dashboard
+                    WHERE (tombstone = 0 OR tombstone IS NULL)
+                      AND dashboard_page_id = ?
+                    ORDER BY y ASC, x ASC
+                    """, arguments: [firstLivePageId])
+            } else {
+                // Pre-pages budget (or every page deleted): widgets carry no
+                // page id.
+                rows = try Row.fetchAll(db, sql: """
+                    SELECT id, type, meta
+                    FROM dashboard
+                    WHERE (tombstone = 0 OR tombstone IS NULL)
+                      AND dashboard_page_id IS NULL
+                    ORDER BY y ASC, x ASC
+                    """)
+            }
 
             return rows.compactMap { row -> DashboardWidget? in
                 guard let id = row["id"] as String?,
@@ -1224,6 +1426,74 @@ class BudgetDatabase {
                 let metaJSON = row["meta"] as String?
                 return DashboardWidget.parse(id: id, type: type, metaJSON: metaJSON)
             }
+        }
+    }
+
+    /// Loads the referenced `custom_reports` rows keyed by id. Tombstoned
+    /// rows and unknown ids are simply absent from the result.
+    func fetchCustomReportConfigs(ids: [String]) async throws -> [String: CustomReportConfig] {
+        guard !ids.isEmpty else { return [:] }
+        return try await dbQueue.read { db in
+            // The app's own migration (1770000000002) creates custom_reports
+            // without upstream's later columns (date_static, include_current,
+            // sort_by); a synced budget file has all of them. Select what
+            // exists and default the rest.
+            let existing = Set(try db.columns(in: "custom_reports").map(\.name))
+            let wanted = [
+                "id", "name", "mode", "group_by", "balance_type", "interval",
+                "graph_type", "date_range", "date_static", "start_date",
+                "end_date", "include_current", "show_empty", "show_offbudget",
+                "show_hidden", "show_uncategorized", "sort_by", "conditions",
+                "conditions_op"
+            ]
+            let select = wanted
+                .map { existing.contains($0) ? $0 : "NULL AS \($0)" }
+                .joined(separator: ", ")
+            let marks = ids.map { _ in "?" }.joined(separator: ",")
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT \(select)
+                FROM custom_reports
+                WHERE id IN (\(marks)) AND (tombstone = 0 OR tombstone IS NULL)
+                """, arguments: StatementArguments(ids))
+            var out: [String: CustomReportConfig] = [:]
+            for row in rows {
+                let conditions = (row["conditions"] as String?)
+                    .flatMap { $0.data(using: .utf8) }
+                    .flatMap { try? JSONDecoder().decode([WidgetRuleCondition].self, from: $0) }
+                let config = CustomReportConfig(
+                    id: row["id"],
+                    name: row["name"] ?? "Custom Report",
+                    mode: row["mode"] ?? "total",
+                    groupBy: row["group_by"] ?? "Category",
+                    balanceType: row["balance_type"] ?? "Payment",
+                    interval: row["interval"] ?? "Monthly",
+                    graphType: row["graph_type"] ?? "BarGraph",
+                    dateRange: row["date_range"],
+                    dateStatic: (row["date_static"] as Int? ?? 0) != 0,
+                    startDate: row["start_date"],
+                    endDate: row["end_date"],
+                    includeCurrent: (row["include_current"] as Int? ?? 0) != 0,
+                    showEmpty: (row["show_empty"] as Int? ?? 0) != 0,
+                    showOffBudget: (row["show_offbudget"] as Int? ?? 0) != 0,
+                    showHidden: (row["show_hidden"] as Int? ?? 0) != 0,
+                    showUncategorized: (row["show_uncategorized"] as Int? ?? 0) != 0,
+                    sortBy: row["sort_by"] ?? "desc",
+                    conditions: conditions,
+                    conditionsOp: row["conditions_op"] ?? "and"
+                )
+                out[config.id] = config
+            }
+            return out
+        }
+    }
+
+    /// Synced pref controlling week bucketing (0 = Sunday … 6 = Saturday).
+    func fetchFirstDayOfWeekIdx() async throws -> Int {
+        try await dbQueue.read { db in
+            guard try db.tableExists("preferences") else { return 0 }
+            let value = try String.fetchOne(
+                db, sql: "SELECT value FROM preferences WHERE id = 'firstDayOfWeekIdx'")
+            return value.flatMap(Int.init) ?? 0
         }
     }
 

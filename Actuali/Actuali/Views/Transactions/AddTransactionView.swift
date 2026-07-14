@@ -24,7 +24,6 @@ struct AddTransactionView: View {
     @State private var userPickedCategory = false
     @State private var nearbyPayees: [NearbyPayee] = []
     @State private var splitLines: [BudgetStore.SplitLineForm] = []
-    @State private var splitChildren: [Transaction] = []
 
     @FocusState private var payeeFocused: Bool
 
@@ -189,8 +188,8 @@ struct AddTransactionView: View {
                             }
                         }
                         .pickerStyle(.segmented)
-                        // A split parent's amount and sign are the children's
-                        // sum; both are edited through the split, not here.
+                        // A split parent's sign is the children's; flipping
+                        // it would have to flip every line, so it stays fixed.
                         .disabled(isEditingSplitParent)
                     }
 
@@ -198,7 +197,6 @@ struct AddTransactionView: View {
                         Text(amountSignSymbol)
                             .foregroundStyle(amountSignColor)
                         AmountInputField(text: $amount)
-                            .disabled(isEditingSplitParent)
                     }
                 }
 
@@ -285,9 +283,9 @@ struct AddTransactionView: View {
                             }
                         }
 
-                        if isEditingSplitParent {
-                            // The category lives on the children; show the
-                            // breakdown in its own section below.
+                        if isEditingSplitParent && !isSplitting {
+                            // Placeholder while the children load into the
+                            // editable split lines below.
                             HStack {
                                 Text("Category")
                                 Spacer()
@@ -322,26 +320,6 @@ struct AddTransactionView: View {
 
                 if isSplitting && !isTransfer {
                     splitEntrySection
-                }
-
-                if isEditingSplitParent && !splitChildren.isEmpty {
-                    Section("Split Breakdown") {
-                        ForEach(splitChildren) { child in
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(child.categoryName ?? "Uncategorized")
-                                    if let childNotes = child.notes, !childNotes.isEmpty {
-                                        Text(childNotes)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                                Spacer()
-                                Text(budgetStore.formatCurrency(child.amount))
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
                 }
 
                 Section {
@@ -393,8 +371,19 @@ struct AddTransactionView: View {
             }
             .disabled(isLoading)
             .task {
-                if let editing, editing.isParent {
-                    splitChildren = await budgetStore.fetchSplitChildren(parentId: editing.id)
+                // Load a split parent's children as editable lines. Inherited
+                // payees load as empty so a parent payee edit follows through
+                // to them, mirroring Actual's cascade rule.
+                if let editing, editing.isParent, splitLines.isEmpty {
+                    splitLines = await budgetStore.fetchSplitChildren(parentId: editing.id).map { child in
+                        BudgetStore.SplitLineForm(
+                            childId: child.id,
+                            categoryId: child.categoryId,
+                            amount: String(format: "%.2f", Double(abs(child.amount)) / 100.0),
+                            notes: child.notes ?? "",
+                            payeeName: (child.payeeName != editing.payeeName ? child.payeeName : nil) ?? ""
+                        )
+                    }
                 }
             }
         }
@@ -415,10 +404,14 @@ struct AddTransactionView: View {
             } label: {
                 Label("Add Line", systemImage: "plus")
             }
-            Button(role: .destructive) {
-                splitLines = []
-            } label: {
-                Text("Remove Split")
+            // An existing split stays a split — un-splitting would have to
+            // collapse the children into the parent, which we don't support.
+            if !isEditingSplitParent {
+                Button(role: .destructive) {
+                    splitLines = []
+                } label: {
+                    Text("Remove Split")
+                }
             }
         } header: {
             Text("Split")
@@ -523,17 +516,26 @@ private struct SplitLineRow: View {
     }
 
     var body: some View {
-        HStack {
-            Button {
-                showCategoryPicker = true
-            } label: {
-                Text(categoryName)
-                    .foregroundStyle(line.categoryId == nil ? Color.secondary : Color.primary)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Button {
+                    showCategoryPicker = true
+                } label: {
+                    Text(categoryName)
+                        .foregroundStyle(line.categoryId == nil ? Color.secondary : Color.primary)
+                }
+                .buttonStyle(.borderless)
+                Spacer()
+                AmountInputField(text: $line.amount)
+                    .frame(width: 110)
             }
-            .buttonStyle(.borderless)
-            Spacer()
-            AmountInputField(text: $line.amount)
-                .frame(width: 110)
+            // Empty payee inherits the transaction's payee
+            TextField("Payee (optional)", text: $line.payeeName)
+                .font(.subheadline)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.words)
+            TextField("Notes (optional)", text: $line.notes)
+                .font(.subheadline)
         }
         .sheet(isPresented: $showCategoryPicker) {
             NavigationStack {

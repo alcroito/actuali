@@ -154,12 +154,35 @@ final class BudgetStore: ObservableObject {
         }
     }
 
+    /// Tab the app opens on at launch. Persisted to UserDefaults, defaults to
+    /// Accounts. Read at launch via StartTab.persisted, so changes apply on
+    /// the next launch.
+    @Published var startTab: StartTab = .accounts {
+        didSet {
+            UserDefaults.standard.set(startTab.rawValue, forKey: StartTab.defaultsKey)
+        }
+    }
+
     /// Whether Budget rows show a spent-vs-available progress bar.
     /// Persisted to UserDefaults, defaults to on.
     @Published var showBudgetProgressBars: Bool = true {
         didSet {
             UserDefaults.standard.set(showBudgetProgressBars, forKey: "showBudgetProgressBars")
         }
+    }
+
+    /// Whether the Budget tab shows a badge with the overspent-category
+    /// count (GH #68). Persisted to UserDefaults, defaults to on.
+    @Published var showOverspentBadge: Bool = true {
+        didSet {
+            UserDefaults.standard.set(showOverspentBadge, forKey: "showOverspentBadge")
+        }
+    }
+
+    /// Count the Budget tab badge displays: the current month's overspent
+    /// categories, or 0 when the badge is turned off in Settings.
+    var overspentBadgeCount: Int {
+        showOverspentBadge ? (currentBudgetMonth?.overspentCount ?? 0) : 0
     }
 
     // MARK: - User Preferences (per-budget, stored in UserDefaults)
@@ -232,10 +255,16 @@ final class BudgetStore: ObservableObject {
         if syncClient != nil { return }
         if let loadTask {
             await loadTask.value
-            return
+            // A completed load that produced no database *failed* — e.g. a
+            // transient SQLITE_BUSY when a cold headless launch raced the
+            // entity query's temporary connection (actios-tq4w). Never cache
+            // that failure for the process lifetime: fall through and retry,
+            // so every automation run gets a fresh attempt.
+            if database != nil { return }
         }
         // No in-flight load (e.g. a freshly spawned headless process where the
-        // init() Task hasn't been retained). Start one and await it.
+        // init() Task hasn't been retained), or the last load failed. Start a
+        // fresh one and await it.
         guard let budgetId = currentBudgetId, fileManager.budgetExists(budgetId) else { return }
         let task = Task { await loadLocalBudget(budgetId) }
         loadTask = task
@@ -293,6 +322,12 @@ final class BudgetStore: ObservableObject {
         self.database = database
         self.syncClient = syncClient
     }
+
+    /// Test-only: install an already-completed load task that produced no
+    /// database, simulating an init()-time load that failed (actios-tq4w).
+    func simulateFailedInitialLoadForTesting() {
+        loadTask = Task {}
+    }
     #endif
 
     private init() {
@@ -305,8 +340,11 @@ final class BudgetStore: ObservableObject {
            let mode = AppearanceMode(rawValue: raw) {
             appearanceMode = mode
         }
+        startTab = StartTab.persisted
         showBudgetProgressBars = UserDefaults.standard
             .object(forKey: "showBudgetProgressBars") as? Bool ?? true
+        showOverspentBadge = UserDefaults.standard
+            .object(forKey: "showOverspentBadge") as? Bool ?? true
 
         let token = loadAndMigrateAuthToken()
 
@@ -785,6 +823,9 @@ final class BudgetStore: ObservableObject {
             categoryGroups = fetchedGroups
             payees = fetchedPayees
             currentBudgetMonth = fetchedBudgetMonth
+        } catch is CancellationError {
+            // The caller's task was cancelled (e.g. a .refreshable task the
+            // system tore down). Nothing failed — never alarm the user.
         } catch {
             // If the budget was switched mid-fetch, the failure belongs to
             // the old database — don't surface it over the new budget.
@@ -824,9 +865,35 @@ final class BudgetStore: ObservableObject {
 
     // MARK: - Transactions
 
-    func fetchTransactions(for accountId: String) async -> [Transaction] {
+    /// One page of transactions (newest first), optionally scoped to an
+    /// account and/or filtered by free-text search. See
+    /// BudgetDatabase.fetchTransactions for the exact semantics.
+    func fetchTransactions(
+        accountId: String? = nil,
+        limit: Int = BudgetDatabase.transactionPageSize,
+        offset: Int = 0,
+        search: String? = nil
+    ) async -> [Transaction] {
         do {
-            return try await database?.fetchTransactions(accountId: accountId) ?? []
+            return try await database?.fetchTransactions(
+                accountId: accountId, limit: limit, offset: offset, search: search
+            ) ?? []
+        } catch is CancellationError {
+            // The caller's task was cancelled (e.g. a superseded .task(id:)
+            // search reload). Nothing failed — never alarm the user.
+            return []
+        } catch {
+            self.error = error.localizedDescription
+            return []
+        }
+    }
+
+    /// Every transaction counting toward a category's spend, optionally
+    /// narrowed to one "yyyy-MM" month (see
+    /// BudgetDatabase.fetchCategoryTransactions for the exact filter).
+    func fetchCategoryTransactions(categoryId: String, month: String? = nil) async -> [Transaction] {
+        do {
+            return try await database?.fetchCategoryTransactions(categoryId: categoryId, month: month) ?? []
         } catch {
             self.error = error.localizedDescription
             return []
@@ -954,21 +1021,30 @@ final class BudgetStore: ObservableObject {
     /// Children share their parent's account, date and cleared state; keep
     /// them aligned after a parent edit (mirrors desktop split behavior —
     /// reports read the children, so a stale child date would misfile them).
-    private func cascadeSharedFieldsToChildren(of parent: Transaction) async throws {
+    /// A payee change follows Actual's rule: children whose payee matched
+    /// the parent's old payee follow it; per-line overrides keep theirs.
+    private func cascadeSharedFieldsToChildren(
+        of parent: Transaction,
+        originalPayeeId: String?
+    ) async throws {
         guard let database else { return }
         for child in try await database.fetchChildTransactions(parentId: parent.id) {
             var updated = child
             updated.accountId = parent.accountId
             updated.date = parent.date
             updated.cleared = parent.cleared
+            if child.payeeId == originalPayeeId {
+                updated.payeeId = parent.payeeId
+            }
             if updated != child {
                 try await updateTransaction(updated, original: child)
             }
         }
     }
 
-    /// Split children of a parent, for the edit sheet's breakdown display.
-    /// Failures collapse to an empty list — display only.
+    /// Split children of a parent, for the edit sheet's editable split lines.
+    /// Failures collapse to an empty list — the sheet then behaves like the
+    /// old read-only form (amount/category protected by the standard path).
     func fetchSplitChildren(parentId: String) async -> [Transaction] {
         guard let database else { return [] }
         return (try? await database.fetchChildTransactions(parentId: parentId)) ?? []
@@ -1019,26 +1095,36 @@ final class BudgetStore: ObservableObject {
     }
 
     /// One line of a split entered in the form. `amount` is raw field text,
-    /// unsigned like `TransactionForm.amount`.
+    /// unsigned like `TransactionForm.amount`. An empty `payeeName` means
+    /// the line inherits the transaction's payee (Actual's makeChild rule).
+    /// `childId` links the line to an existing child row when editing a
+    /// split parent; nil means the line is new.
     struct SplitLineForm: Identifiable, Equatable {
         let id: UUID
+        var childId: String?
         var categoryId: String?
         var amount: String
         var notes: String
+        var payeeName: String
 
-        init(id: UUID = UUID(), categoryId: String? = nil, amount: String = "", notes: String = "") {
+        init(id: UUID = UUID(), childId: String? = nil, categoryId: String? = nil, amount: String = "", notes: String = "", payeeName: String = "") {
             self.id = id
+            self.childId = childId
             self.categoryId = categoryId
             self.amount = amount
             self.notes = notes
+            self.payeeName = payeeName
         }
     }
 
     /// A validated split line: signed cents, ready to become a child row.
+    /// `payeeName` nil means inherit the parent's payee.
     struct SplitPlanLine: Equatable {
         var categoryId: String?
         var amountCents: Int
         var notes: String?
+        var payeeName: String? = nil
+        var childId: String? = nil
     }
 
     /// The store-side action a form resolves to. Validation and routing are
@@ -1087,10 +1173,13 @@ final class BudgetStore: ObservableObject {
                   cents > 0 else {
                 throw BudgetStoreError.invalidAmount
             }
+            let payeeName = line.payeeName.trimmingCharacters(in: .whitespacesAndNewlines)
             return SplitPlanLine(
                 categoryId: line.categoryId,
                 amountCents: sign * cents,
-                notes: line.notes.isEmpty ? nil : line.notes
+                notes: line.notes.isEmpty ? nil : line.notes,
+                payeeName: payeeName.isEmpty ? nil : payeeName,
+                childId: line.childId
             )
         }
         guard lines.map(\.amountCents).reduce(0, +) == amountCents else {
@@ -1125,12 +1214,21 @@ final class BudgetStore: ObservableObject {
             )
 
         case .split(let amountCents, let lines):
-            // Converting an existing transaction into a split would leave its
-            // history (transfer links, reconciliation) on a parent whose
-            // children were never reconciled. Refuse, like transfers; the UI
-            // hides split entry when editing.
-            guard original == nil else {
-                throw BudgetStoreError.cannotConvertToSplit
+            if let original {
+                // Editing an existing split parent: reconcile its children
+                // against the form's lines. Converting a non-split into a
+                // split stays refused — that would leave its history
+                // (transfer links, reconciliation) on a parent whose
+                // children were never reconciled.
+                guard original.isParent else {
+                    throw BudgetStoreError.cannotConvertToSplit
+                }
+                try await updateSplit(
+                    original: original, form: form,
+                    amountCents: amountCents, lines: lines,
+                    date: date, notes: notes
+                )
+                return
             }
             let payeeId = try await resolvePayeeId(name: form.payeeName, editing: nil)
             let payeeName = form.payeeName.isEmpty ? nil : form.payeeName
@@ -1156,14 +1254,26 @@ final class BudgetStore: ObservableObject {
                 sortOrder: parentSort,
                 importedPayee: payeeName
             )
-            let children = lines.enumerated().map { index, line in
-                Transaction(
+            var children: [Transaction] = []
+            for (index, line) in lines.enumerated() {
+                // Children inherit the parent's payee unless the line names
+                // its own (Actual's makeChild semantics).
+                let childPayeeId: String?
+                let childPayeeName: String?
+                if let lineName = line.payeeName, lineName != payeeName {
+                    childPayeeId = try await resolvePayeeId(name: lineName, editing: nil)
+                    childPayeeName = lineName
+                } else {
+                    childPayeeId = payeeId
+                    childPayeeName = payeeName
+                }
+                children.append(Transaction(
                     id: UUID().uuidString,
                     accountId: form.accountId,
                     date: date,
                     amount: line.amountCents,
-                    payeeId: nil,  // the payee lives on the parent
-                    payeeName: nil,
+                    payeeId: childPayeeId,
+                    payeeName: childPayeeName,
                     categoryId: line.categoryId,
                     categoryName: nil,
                     notes: line.notes,
@@ -1175,7 +1285,7 @@ final class BudgetStore: ObservableObject {
                     tombstone: false,
                     sortOrder: parentSort - Double(index + 1),
                     importedPayee: nil
-                )
+                ))
             }
             guard let syncClient else {
                 throw BudgetStoreError.syncNotConfigured
@@ -1214,7 +1324,8 @@ final class BudgetStore: ObservableObject {
                 )
                 try await updateTransaction(updated, original: original)
                 if original.isParent {
-                    try await cascadeSharedFieldsToChildren(of: updated)
+                    try await cascadeSharedFieldsToChildren(
+                        of: updated, originalPayeeId: original.payeeId)
                 }
             } else {
                 let transaction = Transaction(
@@ -1241,6 +1352,137 @@ final class BudgetStore: ObservableObject {
                     recordPayeeLocationIfAppropriate(payeeId: payeeId)
                 }
             }
+        }
+    }
+
+    /// Apply an edited split form to an existing split parent: the parent
+    /// takes the form's total/payee/notes/date/cleared, lines with a
+    /// `childId` update their child row, lines without one become new
+    /// children, and children missing from the form are tombstoned.
+    private func updateSplit(
+        original: Transaction,
+        form: TransactionForm,
+        amountCents: Int,
+        lines: [SplitPlanLine],
+        date: Int,
+        notes: String?
+    ) async throws {
+        guard let syncClient, let database else {
+            throw BudgetStoreError.syncNotConfigured
+        }
+
+        let payeeId = try await resolvePayeeId(name: form.payeeName, editing: original)
+        let payeeName = form.payeeName.isEmpty ? nil : form.payeeName
+        let parent = Transaction(
+            id: original.id,
+            accountId: form.accountId,
+            date: date,
+            amount: amountCents,
+            payeeId: payeeId,
+            payeeName: payeeName,
+            categoryId: nil,  // split parents never carry a category
+            categoryName: nil,
+            notes: notes,
+            cleared: form.cleared,
+            reconciled: original.reconciled,
+            transferId: original.transferId,
+            isParent: true,
+            parentId: nil,
+            tombstone: original.tombstone,
+            sortOrder: original.sortOrder
+        )
+        let parentChanges = Self.changedFields(original: original, updated: parent)
+        if !parentChanges.isEmpty {
+            try await syncClient.updateTransaction(parent, changedFields: parentChanges)
+        }
+
+        let existingChildren = try await database.fetchChildTransactions(parentId: original.id)
+        let childrenById = Dictionary(uniqueKeysWithValues: existingChildren.map { ($0.id, $0) })
+
+        // Existing children keep their sort_order (updates never move rows);
+        // new lines slot in below the current minimum, preserving the order
+        // they were appended in the form.
+        var nextNewSort = (existingChildren.compactMap(\.sortOrder).min()
+            ?? original.sortOrder
+            ?? Date().timeIntervalSince1970 * 1000)
+
+        for line in lines {
+            let existing = line.childId.flatMap { childrenById[$0] }
+            // Children inherit the parent's payee unless the line names its
+            // own (Actual's makeChild semantics). A line whose payee matched
+            // the parent's loads back as "inherit", so a parent payee edit
+            // follows through here just like cascadeSharedFieldsToChildren.
+            let childPayeeId: String?
+            let childPayeeName: String?
+            if let lineName = line.payeeName, lineName != payeeName {
+                childPayeeId = try await resolvePayeeId(name: lineName, editing: existing)
+                childPayeeName = lineName
+            } else {
+                childPayeeId = payeeId
+                childPayeeName = payeeName
+            }
+
+            if let existing {
+                let updated = Transaction(
+                    id: existing.id,
+                    accountId: form.accountId,
+                    date: date,
+                    amount: line.amountCents,
+                    payeeId: childPayeeId,
+                    payeeName: childPayeeName,
+                    categoryId: line.categoryId,
+                    categoryName: nil,
+                    notes: line.notes,
+                    cleared: form.cleared,
+                    reconciled: existing.reconciled,
+                    transferId: existing.transferId,
+                    isParent: false,
+                    parentId: original.id,
+                    tombstone: false,
+                    sortOrder: existing.sortOrder
+                )
+                let changes = Self.changedFields(original: existing, updated: updated)
+                if !changes.isEmpty {
+                    try await syncClient.updateTransaction(updated, changedFields: changes)
+                }
+            } else {
+                nextNewSort -= 1
+                // Rules are skipped, matching createSplit — the user just
+                // spelled out every field on this line explicitly.
+                try await syncClient.createTransaction(Transaction(
+                    id: UUID().uuidString,
+                    accountId: form.accountId,
+                    date: date,
+                    amount: line.amountCents,
+                    payeeId: childPayeeId,
+                    payeeName: childPayeeName,
+                    categoryId: line.categoryId,
+                    categoryName: nil,
+                    notes: line.notes,
+                    cleared: form.cleared,
+                    reconciled: false,
+                    transferId: nil,
+                    isParent: false,
+                    parentId: original.id,
+                    tombstone: false,
+                    sortOrder: nextNewSort,
+                    importedPayee: nil
+                ), applyRules: false)
+            }
+        }
+
+        // Lines removed from the form tombstone their child rows — orphaned
+        // children would be invisible in the list but still feed reports.
+        let keptIds = Set(lines.compactMap(\.childId))
+        for child in existingChildren where !keptIds.contains(child.id) {
+            var deleted = child
+            deleted.tombstone = true
+            try await syncClient.updateTransaction(deleted, changedFields: ["tombstone"])
+        }
+
+        await refreshDataOnly()
+        if let payeeId {
+            recordPayeeLocationIfAppropriate(payeeId: payeeId)
         }
     }
 
@@ -1323,14 +1565,22 @@ final class BudgetStore: ObservableObject {
 
     /// Force immediate sync
     func sync() async {
-        logger.info("sync() called")
-        if syncClient == nil {
-            logger.notice("syncClient is nil, cannot sync!")
+        // Pull-to-refresh runs this inside SwiftUI's .refreshable task, which
+        // the system cancels on further scroll interaction or when the
+        // hosting scroll view goes away (tab switch). Run the pipeline in an
+        // unstructured task so a UI-driven cancellation can't abort a sync
+        // mid-flight or poison the refresh reads with CancellationError.
+        let work = Task {
+            logger.info("sync() called")
+            if syncClient == nil {
+                logger.notice("syncClient is nil, cannot sync!")
+            }
+            await syncClient?.syncNow()
+            lastSyncTime = Date()
+            logger.debug("sync() completed, refreshing data...")
+            await refreshDataOnly()
         }
-        await syncClient?.syncNow()
-        lastSyncTime = Date()
-        logger.debug("sync() completed, refreshing data...")
-        await refreshDataOnly()
+        await work.value
     }
 
     /// Discard local sync state and re-adopt the server's Merkle tree.
@@ -1370,6 +1620,8 @@ final class BudgetStore: ObservableObject {
             // month flips), this result is stale — drop it.
             guard requestedBudgetMonth == month else { return }
             currentBudgetMonth = fetched
+        } catch is CancellationError {
+            // Hosting view task cancelled (rapid month flips) — not an error.
         } catch {
             guard requestedBudgetMonth == month else { return }
             self.error = error.localizedDescription
