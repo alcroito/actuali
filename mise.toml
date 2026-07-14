@@ -30,3 +30,27 @@ run = [
 [tasks.release-test-clean]
 description = "Delete the throwaway test release and its tag"
 run = "gh release delete v0.0.0-ci-test --cleanup-tag --yes"
+
+[tasks.release]
+description = "Publish a fork release tagged v<version>-<build>-<date>-fork (versions parsed from project.pbxproj); triggers the release workflow"
+usage = '''
+arg "<tag>" help="Full release tag; skips version/date construction" default=""
+flag "--version <version>" help="Override MARKETING_VERSION"
+flag "--build <build>" help="Override CURRENT_PROJECT_VERSION"
+flag "--bundle-id <bundle_id>" help="App bundle id used to locate versions in project.pbxproj" default="com.mfazz.ActualiOS"
+flag "--target <target>" help="Commit-ish the tag points at" default="main"
+flag "--title <title>" help="Release title (default: the tag)"
+flag "--notes <notes>" help="Release body (default: auto-generated from commits)"
+flag "--prerelease" help="Mark the release as a prerelease"
+'''
+run = '''
+TAG="${usage_tag:-}" \
+VERSION="${usage_version:-}" \
+BUILD="${usage_build:-}" \
+BUNDLE_ID="${usage_bundle_id:-com.mfazz.ActualiOS}" \
+TARGET="${usage_target:-main}" \
+TITLE="${usage_title:-}" \
+NOTES="${usage_notes:-}" \
+PRERELEASE="${usage_prerelease:-}" \
+./scripts/ci/create-release.sh
+'''
